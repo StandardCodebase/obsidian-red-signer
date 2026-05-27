@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type ManifestEntry struct {
@@ -24,14 +25,18 @@ func main() {
 	printPubKeyFlag := flag.Bool("print-pubkey", false, "Print the current public key and exit")
 	flag.Parse()
 
+	// Use global home directory to prevent key exposure via vault syncing tools
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] Cannot find home dir: %v\n", err)
+		os.Exit(1)
+	}
+	keyDir := filepath.Join(homeDir, ".red-network")
+	keyPath := filepath.Join(keyDir, "maintainer.key")
+	pubKeyPath := filepath.Join(keyDir, "maintainer.pub")
+
 	// Special mode: print public key from existing private key
 	if *printPubKeyFlag {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] Cannot find home dir: %v\n", err)
-			os.Exit(1)
-		}
-		keyPath := filepath.Join(homeDir, ".red-network", "maintainer.key")
 		privKey, err := loadPrivateKey(keyPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
@@ -60,18 +65,10 @@ func main() {
 	hashHex := hex.EncodeToString(hash[:])
 
 	// --- Key management ---
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR] Cannot find home dir: %v\n", err)
-		os.Exit(1)
-	}
-	keyDir := filepath.Join(homeDir, ".red-network")
 	if err := os.MkdirAll(keyDir, 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] Cannot create key dir: %v\n", err)
 		os.Exit(1)
 	}
-	keyPath := filepath.Join(keyDir, "maintainer.key")
-	pubKeyPath := filepath.Join(keyDir, "maintainer.pub")
 
 	var privKey ed25519.PrivateKey
 	var pubKey ed25519.PublicKey
@@ -81,7 +78,7 @@ func main() {
 		privKey = ed25519.PrivateKey(keyBytes)
 		pubKey = privKey.Public().(ed25519.PublicKey)
 		fmt.Fprintln(os.Stderr, "[SYS] Loaded existing identity.")
-		// Ensure public key file exists (for other tools)
+
 		pubKeyHex := hex.EncodeToString(pubKey)
 		if err := os.WriteFile(pubKeyPath, []byte(pubKeyHex), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "[WARN] Could not write public key file: %v\n", err)
@@ -130,6 +127,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[ERROR] Cannot compute relative path: %v\n", err)
 		os.Exit(1)
 	}
+
+	// FIX: Path Traversal Prevention
+	relPath = filepath.Clean(relPath)
+	if strings.HasPrefix(relPath, "..") {
+		fmt.Fprintf(os.Stderr, "[ERROR] Markdown file is outside the manifest directory boundary: %s\n", relPath)
+		os.Exit(1)
+	}
+
 	mapKey := filepath.ToSlash(relPath)
 
 	if err := atomicUpdateManifest(manifestPath, mapKey, hashHex,
