@@ -39,61 +39,92 @@ const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const util_1 = require("util");
 const crypto_1 = require("crypto");
-// FIX: Use execFile instead of exec to prevent command injection
 const execFilePromise = (0, util_1.promisify)(child_process_1.execFile);
-// --- Modal for signing with public key display ---
+// --- Predefined sub‑branch options per branch ---
+const subBranchOptions = {
+    "Formal Sciences": ["Logic", "Mathematics", "Computer Science", "Statistics", "Information Theory"],
+    "Physical Sciences": ["Physics", "Chemistry", "Astronomy", "Earth Sciences", "Materials Science"],
+    "Social Sciences": ["Sociology", "Psychology", "Economics", "Political Science", "Anthropology"],
+    "Applied Sciences": ["Engineering", "Medicine", "Agriculture", "Architecture", "Technology", "Cryptography"],
+    "Arts & Humanities": ["Literature", "History", "Philosophy", "Visual Arts", "Music", "Theatre"],
+    "Philosophy & Ethics": ["Epistemology", "Metaphysics", "Ethics", "Aesthetics", "Logic"]
+};
+// --- Modal with branch and sub‑branch selection ---
 class SignModal extends obsidian_1.Modal {
     constructor(app, plugin, file) {
         super(app);
         this.publicKey = null;
+        this.isAuthor = false;
         this.plugin = plugin;
         this.file = file;
     }
     async onOpen() {
         this.publicKey = await this.plugin.getPublicKey();
+        this.isAuthor = await this.plugin.isBranchAuthor();
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl("h2", { text: "Red Signer" });
         if (!this.file) {
-            contentEl.createEl("p", {
-                text: "No markdown file is currently active.",
-            });
+            contentEl.createEl("p", { text: "No markdown file is currently active." });
             return;
         }
         contentEl.createEl("h3", { text: `Current file: ${this.file.name}` });
         contentEl.createEl("h4", { text: "Your Public Key:" });
-        const keyContainer = contentEl.createDiv({
-            cls: "red-signer-key-container",
-        });
+        const keyContainer = contentEl.createDiv({ cls: "red-signer-key-container" });
         if (this.publicKey) {
             const keyText = keyContainer.createEl("code", { text: this.publicKey });
-            keyText.style.wordBreak = "break-all";
-            keyText.style.display = "block";
-            keyText.style.margin = "0.5em 0";
-            keyText.style.padding = "0.5em";
-            keyText.style.backgroundColor = "#f0f0f0";
-            keyText.style.borderRadius = "4px";
-            const copyBtn = keyContainer.createEl("button", {
-                text: "Copy to Clipboard",
-            });
+            keyText.style.cssText = "word-break:break-all; display:block; margin:0.5em 0; padding:0.5em; background:#f0f0f0; border-radius:4px;";
+            const copyBtn = keyContainer.createEl("button", { text: "Copy to Clipboard" });
             copyBtn.onclick = async () => {
                 await navigator.clipboard.writeText(this.publicKey);
                 new obsidian_1.Notice("Public key copied!");
             };
         }
         else {
-            keyContainer.createEl("p", {
-                text: "No public key found. Sign a note first to generate one.",
-            });
+            keyContainer.createEl("p", { text: "No public key found. Sign a note first to generate one." });
         }
-        const signBtn = contentEl.createEl("button", {
-            text: "✍️ Sign this note",
-            cls: "mod-cta",
-        });
+        // --- Branch selection (only if author) ---
+        contentEl.createEl("h4", { text: "Knowledge Branch" });
+        const branchSelect = contentEl.createEl("select");
+        const branches = Object.keys(subBranchOptions);
+        const currentBranch = this.plugin.currentBranch;
+        for (const b of branches) {
+            const option = branchSelect.createEl("option", { text: b });
+            if (currentBranch === b)
+                option.selected = true;
+        }
+        if (!this.isAuthor)
+            branchSelect.disabled = true;
+        // --- Sub‑branch dropdown (dynamic based on branch) ---
+        contentEl.createEl("h4", { text: "Sub‑Branch" });
+        const subBranchSelect = contentEl.createEl("select");
+        const updateSubBranchOptions = () => {
+            const selectedBranch = branchSelect.value;
+            const options = subBranchOptions[selectedBranch] || ["General"];
+            subBranchSelect.empty();
+            for (const opt of options) {
+                const option = subBranchSelect.createEl("option", { text: opt });
+                if (this.plugin.currentSubBranch === opt)
+                    option.selected = true;
+            }
+        };
+        updateSubBranchOptions();
+        branchSelect.addEventListener("change", updateSubBranchOptions);
+        if (!this.isAuthor)
+            subBranchSelect.disabled = true;
+        if (!this.isAuthor && this.plugin.currentBranch) {
+            contentEl.createEl("p", { text: "🔒 Classification locked by original author.", cls: "red-signer-lock" });
+        }
+        const signBtn = contentEl.createEl("button", { text: "✍️ Sign this note", cls: "mod-cta" });
         signBtn.style.marginTop = "1em";
         signBtn.onclick = async () => {
             signBtn.disabled = true;
             signBtn.setText("Signing...");
+            if (this.isAuthor) {
+                const newBranch = branchSelect.value;
+                const newSubBranch = subBranchSelect.value;
+                await this.plugin.updateManifestBranch(newBranch, newSubBranch);
+            }
             await this.plugin.signFile(this.file);
             this.close();
         };
@@ -114,6 +145,8 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         this.pluginDir = "";
         this.vaultRoot = "";
         this.statusBarItem = null;
+        this.currentBranch = "";
+        this.currentSubBranch = "";
     }
     async onload() {
         this.vaultRoot = this.app.vault.adapter.getBasePath();
@@ -121,7 +154,6 @@ class RedSignerPlugin extends obsidian_1.Plugin {
             new obsidian_1.Notice("❌ This plugin only works on desktop Obsidian.");
             return;
         }
-        // DYNAMIC FOLDER RESOLUTION
         const manifestDir = this.manifest.dir || "";
         this.pluginDir = path.join(this.vaultRoot, manifestDir);
         let binaryName;
@@ -130,7 +162,7 @@ class RedSignerPlugin extends obsidian_1.Plugin {
                 binaryName = "signer-windows-x64.exe";
                 break;
             case "darwin":
-                binaryName = "signer-macos-x64";
+                binaryName = process.arch === "arm64" ? "signer-macos-arm64" : "signer-macos-x64";
                 break;
             case "linux":
                 binaryName = "signer-linux-x64";
@@ -155,21 +187,20 @@ class RedSignerPlugin extends obsidian_1.Plugin {
             new obsidian_1.Notice(`❌ Signer binary missing at ${this.binaryPath}`, 0);
             console.error(`Missing: ${this.binaryPath}`);
         }
-        // --- Status Bar Indicator ---
+        // Ensure README in the key directory
+        this.ensureReadme().catch(console.error);
+        await this.loadBranchFromManifest();
         this.statusBarItem = this.addStatusBarItem();
         this.statusBarItem.addClass("red-signer-status");
         this.updateStatusForActiveFile();
-        // --- Events to refresh status ---
         this.registerEvent(this.app.vault.on("modify", (file) => {
             const activeFile = this.app.workspace.getActiveFile();
-            if (activeFile && file === activeFile) {
+            if (activeFile && file === activeFile)
                 this.updateStatusForActiveFile();
-            }
         }));
         this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
             this.updateStatusForActiveFile();
         }));
-        // --- Ribbon icon ---
         this.addRibbonIcon("signature", "Red Signer: Sign current note", async () => {
             const file = this.app.workspace.getActiveFile();
             if (file && file.extension === "md") {
@@ -179,21 +210,16 @@ class RedSignerPlugin extends obsidian_1.Plugin {
                 new obsidian_1.Notice("Please open a markdown note first.");
             }
         });
-        // --- Editor menu (direct sign) ---
         this.registerEvent(this.app.workspace.on("editor-menu", (menu, _editor, view) => {
             const file = view.file;
             if (file && file.extension === "md") {
                 menu.addItem((item) => {
-                    item
-                        .setTitle("Sign this note directly")
+                    item.setTitle("Sign this note directly")
                         .setIcon("checkmark")
-                        .onClick(async () => {
-                        await this.signFile(file);
-                    });
+                        .onClick(async () => { await this.signFile(file); });
                 });
             }
         }));
-        // --- Commands ---
         this.addCommand({
             id: "sign-current-note",
             name: "Sign current note",
@@ -213,7 +239,104 @@ class RedSignerPlugin extends obsidian_1.Plugin {
             callback: () => this.copyPublicKey(),
         });
     }
+    async ensureReadme() {
+        const homedir = require('os').homedir();
+        const redNetworkDir = path.join(homedir, ".red-network");
+        const readmePath = path.join(redNetworkDir, "README.md");
+        if (!fs.existsSync(readmePath)) {
+            if (!fs.existsSync(redNetworkDir)) {
+                fs.mkdirSync(redNetworkDir, { recursive: true, mode: 0o700 });
+            }
+            const content = `# RED Network Identity
+  
+This directory contains your private Ed25519 key (maintainer.key) used by the Red Signer Obsidian plugin.
+
+**⚠️ WARNING: Do not delete this file unless you intend to lose your contributor identity.**
+
+- If you delete maintainer.key, you will no longer be able to sign notes as the original author of any vault.
+- You will lose the ability to modify branch classification for vaults you authored.
+- A new key will be generated automatically, but it will be a different identity.
+
+To back up your identity, copy the file maintainer.key to a secure location (e.g., an encrypted USB drive).
+
+For more information, see https://github.com/RED-Collective/red-engine
+        `;
+            fs.writeFileSync(readmePath, content, { mode: 0o644 });
+            console.log("Created README in ~/.red-network");
+        }
+    }
+    async loadBranchFromManifest() {
+        const manifestPath = path.join(this.vaultRoot, "manifest.json");
+        try {
+            const data = await fs.promises.readFile(manifestPath, "utf8");
+            const manifest = JSON.parse(data);
+            this.currentBranch = manifest.branch || "";
+            this.currentSubBranch = manifest.sub_branch || "";
+        }
+        catch (err) {
+            if (err.code !== "ENOENT") {
+                console.error("Failed to read manifest for branch info:", err);
+            }
+            this.currentBranch = "";
+            this.currentSubBranch = "";
+        }
+    }
+    async isBranchAuthor() {
+        const manifestPath = path.join(this.vaultRoot, "manifest.json");
+        try {
+            const data = await fs.promises.readFile(manifestPath, "utf8");
+            const manifest = JSON.parse(data);
+            const authorPubKey = manifest.branch_author;
+            if (!authorPubKey)
+                return true;
+            const currentPubKey = await this.getPublicKey();
+            return currentPubKey === authorPubKey;
+        }
+        catch (err) {
+            if (err.code === "ENOENT")
+                return true;
+            console.error("Error checking branch author:", err);
+            return false;
+        }
+    }
+    async updateManifestBranch(branch, subBranch) {
+        const isAuthor = await this.isBranchAuthor();
+        if (!isAuthor) {
+            new obsidian_1.Notice("❌ Only the original author can change the branch classification.");
+            return false;
+        }
+        const manifestPath = path.join(this.vaultRoot, "manifest.json");
+        let manifest = { files: {} };
+        try {
+            const data = await fs.promises.readFile(manifestPath, "utf8");
+            manifest = JSON.parse(data);
+        }
+        catch (err) {
+            if (err.code !== "ENOENT") {
+                new obsidian_1.Notice(`Failed to read manifest: ${err.message}`);
+                return false;
+            }
+        }
+        const oldBranch = manifest.branch || "(none)";
+        const oldSub = manifest.sub_branch || "(none)";
+        const confirmMsg = `Change classification from\nBranch: ${oldBranch}\nSub‑branch: ${oldSub}\nto\nBranch: ${branch}\nSub‑branch: ${subBranch} ?\n\nThis will affect the entire vault.`;
+        if (!confirm(confirmMsg))
+            return false;
+        manifest.branch = branch;
+        manifest.sub_branch = subBranch;
+        if (!manifest.branch_author) {
+            const currentPubKey = await this.getPublicKey();
+            if (currentPubKey)
+                manifest.branch_author = currentPubKey;
+        }
+        await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        this.currentBranch = branch;
+        this.currentSubBranch = subBranch;
+        new obsidian_1.Notice("✅ Branch classification updated.");
+        return true;
+    }
     async updateStatusForActiveFile() {
+        var _a;
         if (!this.statusBarItem)
             return;
         const file = this.app.workspace.getActiveFile();
@@ -223,33 +346,28 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         }
         const manifestPath = path.join(this.vaultRoot, "manifest.json");
         const mapKey = file.path;
-        let manifest = null;
         try {
             const data = await fs.promises.readFile(manifestPath, "utf8");
-            manifest = JSON.parse(data);
+            const manifest = JSON.parse(data);
+            const entry = (_a = manifest.files) === null || _a === void 0 ? void 0 : _a[mapKey];
+            if (!entry) {
+                this.showUnsigned();
+                return;
+            }
+            const content = await this.app.vault.readBinary(file);
+            const hash = (0, crypto_1.createHash)("sha256").update(Buffer.from(content)).digest("hex");
+            if (hash === entry.file_hash) {
+                this.statusBarItem.setText("✓ Signed");
+                this.statusBarItem.style.color = "var(--color-green)";
+            }
+            else {
+                this.showUnsigned();
+            }
         }
         catch (err) {
             if (err.code !== "ENOENT") {
-                new obsidian_1.Notice("⚠️ Manifest Corrupted or Unreadable");
-                console.error("Manifest read error:", err);
+                console.error("Status check error:", err);
             }
-            this.showUnsigned();
-            return;
-        }
-        const entry = manifest[mapKey];
-        if (!entry) {
-            this.showUnsigned();
-            return;
-        }
-        const content = await this.app.vault.readBinary(file);
-        const hash = (0, crypto_1.createHash)("sha256")
-            .update(Buffer.from(content))
-            .digest("hex");
-        if (hash === entry.file_hash) {
-            this.statusBarItem.setText("✓ Signed");
-            this.statusBarItem.style.color = "var(--color-green)";
-        }
-        else {
             this.showUnsigned();
         }
     }
@@ -266,14 +384,13 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         }
         const fullPath = this.app.vault.adapter.getFullPath(file.path);
         if (!fullPath) {
-            new obsidian_1.Notice(`❌ Cannot get file path.`);
+            new obsidian_1.Notice("❌ Cannot get file path.");
             return;
         }
         const manifestPath = path.join(this.vaultRoot, "manifest.json");
         console.log(`Using manifest: ${manifestPath}`);
         new obsidian_1.Notice(`🔏 Signing ${file.name}...`);
         try {
-            // FIX: Use execFilePromise with strict array arguments
             const { stdout, stderr } = await execFilePromise(this.binaryPath, [
                 `--manifest=${manifestPath}`,
                 fullPath,
@@ -287,15 +404,16 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         }
         catch (error) {
             const errorMsg = error.message + (error.stderr || "");
-            if (errorMsg.includes("--init") ||
-                errorMsg.includes("no manifest.json")) {
+            if (errorMsg.includes("--init") || errorMsg.includes("no manifest.json")) {
                 new obsidian_1.Notice(`📄 Creating manifest at ${manifestPath}...`);
-                await this.initManifest(manifestPath);
+                const args = ["--init", `--manifest=${manifestPath}`];
+                if (this.currentBranch)
+                    args.push(`--branch=${this.currentBranch}`);
+                if (this.currentSubBranch)
+                    args.push(`--sub-branch=${this.currentSubBranch}`);
+                args.push(fullPath);
                 try {
-                    const { stdout, stderr } = await execFilePromise(this.binaryPath, [
-                        `--manifest=${manifestPath}`,
-                        fullPath,
-                    ]);
+                    const { stdout, stderr } = await execFilePromise(this.binaryPath, args);
                     if (stderr)
                         console.warn(stderr);
                     console.log(stdout);
@@ -315,13 +433,13 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         }
     }
     async initManifest(manifestPath) {
+        const args = ["--init", `--manifest=${manifestPath}`];
+        if (this.currentBranch)
+            args.push(`--branch=${this.currentBranch}`);
+        if (this.currentSubBranch)
+            args.push(`--sub-branch=${this.currentSubBranch}`);
         try {
-            const dummyPath = path.join(this.vaultRoot, "dummy.md");
-            const { stderr } = await execFilePromise(this.binaryPath, [
-                "--init",
-                `--manifest=${manifestPath}`,
-                dummyPath,
-            ]);
+            const { stderr } = await execFilePromise(this.binaryPath, args);
             if (stderr)
                 console.warn(stderr);
             new obsidian_1.Notice(`✅ Manifest created at ${manifestPath}`);
@@ -345,9 +463,7 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         if (!fs.existsSync(this.binaryPath))
             return null;
         try {
-            const { stdout } = await execFilePromise(this.binaryPath, [
-                "--print-pubkey",
-            ]);
+            const { stdout } = await execFilePromise(this.binaryPath, ["--print-pubkey"]);
             return stdout.trim();
         }
         catch (err) {
@@ -358,10 +474,10 @@ class RedSignerPlugin extends obsidian_1.Plugin {
         const pubKey = await this.getPublicKey();
         if (pubKey) {
             await navigator.clipboard.writeText(pubKey);
-            new obsidian_1.Notice(`📋 Public key copied to clipboard.`);
+            new obsidian_1.Notice("📋 Public key copied to clipboard.");
         }
         else {
-            new obsidian_1.Notice(`❌ No public key found. Sign a note first to generate one.`);
+            new obsidian_1.Notice("❌ No public key found. Sign a note first to generate one.");
         }
     }
     onunload() { }
